@@ -1,0 +1,2 @@
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -NoExit -ExecutionPolicy Bypass -File """ & CreateObject("WScript.Shell").CurrentDirectory & "\ScriptToRunBridge.ps1""", 1, False 
