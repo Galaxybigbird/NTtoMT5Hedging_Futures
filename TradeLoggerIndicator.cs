@@ -31,9 +31,64 @@ namespace NinjaTrader.NinjaScript.Indicators
             httpClient = new HttpClient();
         }
 
+        private string accountName = string.Empty;
+        
         [NinjaScriptProperty]
-        [Display(Name = "Account Name", GroupName = "Parameters", Order = 0)]
-        public string AccountName { get; set; }
+        [Display(Name = "Account", GroupName = "Parameters", Order = 0)]
+        [TypeConverter(typeof(AccountNameConverter))]
+        public string AccountName
+        { 
+            get { return accountName; }
+            set
+            {
+                accountName = value;
+                if (State == State.SetDefaults || State == State.Configure)
+                {
+                    if (Account.All != null)
+                    {
+                        foreach (Account acc in Account.All)
+                        {
+                            if (acc.Name == value)
+                            {
+                                selectedAccount = acc;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Custom TypeConverter for Account dropdown
+        public class AccountNameConverter : TypeConverter
+        {
+            public override StandardValuesCollection GetStandardValues(ITypeDescriptorContext context)
+            {
+                List<string> accountNames = new List<string>();
+                if (Account.All != null)
+                {
+                    foreach (Account account in Account.All)
+                    {
+                        // Only add accounts that are connected/active
+                        if (account.Connection != null && account.Connection.Status == ConnectionStatus.Connected)
+                        {
+                            accountNames.Add(account.Name);
+                        }
+                    }
+                }
+                return new StandardValuesCollection(accountNames);
+            }
+
+            public override bool GetStandardValuesSupported(ITypeDescriptorContext context)
+            {
+                return true;
+            }
+
+            public override bool GetStandardValuesExclusive(ITypeDescriptorContext context)
+            {
+                return true;
+            }
+        }
 
         [NinjaScriptProperty]
         [Display(Name = "Python Server URL", GroupName = "Parameters", Order = 1)]
@@ -53,24 +108,28 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ClearOutputWindow();
                 Print("====== TradeLoggerIndicator Debug Info ======");
                 Print($"Current State: {State}");
-                Print($"Looking for account: '{AccountName}'");
+                Print($"Selected Account: '{AccountName}'");
                 Print("Available accounts:");
                 
                 bool foundAny = false;
                 foreach (Account acc in Account.All)
                 {
-                    foundAny = true;
-                    Print($"- Account Name: '{acc.Name}'");
-                    if (acc.Name == AccountName)
+                    // Only check connected/active accounts
+                    if (acc.Connection != null && acc.Connection.Status == ConnectionStatus.Connected)
                     {
-                        selectedAccount = acc;
-                        Print($"Found matching account: '{acc.Name}'");
+                        foundAny = true;
+                        Print($"- Account Name: '{acc.Name}'");
+                        if (acc.Name == AccountName)
+                        {
+                            selectedAccount = acc;
+                            Print($"Found matching account: '{acc.Name}'");
+                        }
                     }
                 }
                 
                 if (!foundAny)
                 {
-                    Print("WARNING: No accounts found in Account.All!");
+                    Print("WARNING: No connected accounts found!");
                 }
 
                 if (selectedAccount == null)
