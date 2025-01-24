@@ -1,14 +1,12 @@
 import json
 from flask import Flask, request, jsonify
-import csv
 from datetime import datetime
+from collections import deque
 
 app = Flask(__name__)
 
-# Store trades in CSV for backup
-TRADES_FILE = "trades.csv"
-# Store the latest trade for MT5 to pick up
-latest_trade = None
+# Store trades in a queue for MT5 to pick up
+trade_queue = deque()
 
 # Symbol mapping from NinjaTrader to MT5
 SYMBOL_MAP = {
@@ -26,85 +24,121 @@ def map_symbol(nt_symbol):
     # First, clean any suffixes like '@E-MINI'
     clean_symbol = nt_symbol.split('@')[0].strip()
     
-    # Extract just the base symbol (NQ, ES, YM, GC) by taking only the letters
-    # This will remove any contract months (MAR24, DEC23, etc.)
+    # If the symbol is already in MT5 format, return it as is
+    if clean_symbol in SYMBOL_MAP.values():
+        print(f"Symbol mapping: {nt_symbol} -> {clean_symbol} -> {clean_symbol} -> {clean_symbol}")
+        return clean_symbol
+    
+    # Check if this is a contract month symbol
+    if any(month in clean_symbol for month in ["MAR", "JUN", "SEP", "DEC"]):
+        # For contract months, keep the original symbol
+        print(f"Symbol mapping: {nt_symbol} -> {clean_symbol} -> {clean_symbol} -> {clean_symbol}")
+        return clean_symbol
+    
+    # Extract just the base symbol (NQ, ES, YM, GC)
     base_symbol = ''.join(c for c in clean_symbol if c.isalpha())
     
-    print(f"Symbol mapping: {nt_symbol} -> {clean_symbol} -> {base_symbol} -> {SYMBOL_MAP.get(base_symbol, base_symbol)}")
-    return SYMBOL_MAP.get(base_symbol, base_symbol)
+    # Get the mapped symbol or return the base symbol if no mapping exists
+    mapped_symbol = SYMBOL_MAP.get(base_symbol, base_symbol)
+    print(f"Symbol mapping: {nt_symbol} -> {clean_symbol} -> {base_symbol} -> {mapped_symbol}")
+    return mapped_symbol
 
 def format_trade_for_mt5(trade_data):
+    # Validate required fields
+    required_fields = ["instrument", "action", "quantity", "price", "time", "account"]
+    missing_fields = [field for field in required_fields if field not in trade_data]
+    if missing_fields:
+        raise ValueError(f"Missing required fields: {missing_fields}")
+    
+    # Validate action type
+    valid_actions = ["Buy", "Sell"]
+    if trade_data["action"] not in valid_actions:
+        raise ValueError(f"Invalid action: {trade_data['action']}. Must be one of {valid_actions}")
+    
+    # Validate quantity
+    quantity = float(trade_data["quantity"])
+    if quantity <= 0:
+        raise ValueError(f"Invalid quantity: {quantity}. Must be greater than 0")
+    
     # Convert NinjaTrader trade data to MT5 format
-    mt5_symbol = map_symbol(trade_data.get("instrument", ""))
-    print(f"Mapping symbol from {trade_data.get('instrument')} to {mt5_symbol}")
+    mt5_symbol = map_symbol(trade_data["instrument"])
+    print(f"Mapping symbol from {trade_data['instrument']} to {mt5_symbol}")
     
     # Determine if this is a closing trade based on the action
-    is_closing = trade_data.get("is_exit", False)  # Add support for explicit exit flag
-    action = trade_data.get("action")
+    is_closing = trade_data.get("is_exit", False)
+    action = trade_data["action"]
     
     # Debug the incoming trade data
     print(f"Raw trade data: {trade_data}")
     print(f"Is closing trade: {is_closing}")
     
     formatted_trade = {
-        "time": trade_data.get("time"),
+        "time": trade_data["time"],
         "symbol": mt5_symbol,
         "type": "Sell" if action == "Buy" else "Buy",  # Reverse the direction
-        "volume": float(trade_data.get("quantity", 0.1)),
-        "price": float(trade_data.get("price", 0)),
-        "comment": f"Hedge_{trade_data.get('account')}",
-        "is_close": is_closing  # Add flag to indicate if this is a closing trade
+        "volume": quantity,
+        "price": float(trade_data["price"]),
+        "comment": f"Hedge_{trade_data['account']}",
+        "is_close": is_closing
     }
     print(f"Formatted trade for MT5: {formatted_trade}")
     return formatted_trade
 
-def save_trade_to_csv(trade_data):
-    try:
-        with open(TRADES_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.now().isoformat(),
-                trade_data['instrument'],
-                trade_data['action'],
-                trade_data['quantity'],
-                trade_data['price'],
-                trade_data['account']
-            ])
-        print(f"Trade saved to CSV: {trade_data}")
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
-
 @app.route('/log_trade', methods=['POST'])
 def log_trade():
-    global latest_trade
     try:
         print("\n=== Received POST to /log_trade ===")
-        trade_data = request.json
-        print(f"Received trade from NT8: {trade_data}")
         
-        # Save trade to CSV as backup
-        save_trade_to_csv(trade_data)
+        # Check for valid JSON
+        if not request.is_json:
+            error_msg = "Request must be JSON"
+            print(f"Error: {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
+            
+        try:
+            trade_data = request.json
+            print(f"Received trade from NT8: {trade_data}")
+        except Exception as e:
+            error_msg = f"Invalid JSON: {str(e)}"
+            print(f"Error: {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
+        
+        # Validate required fields
+        required_fields = ["time", "instrument", "action", "quantity", "price", "account"]
+        missing_fields = [field for field in required_fields if field not in trade_data]
+        if missing_fields:
+            error_msg = f"Missing required fields: {missing_fields}"
+            print(f"Error: {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
         
         # Format and store trade for MT5
-        latest_trade = format_trade_for_mt5(trade_data)
-        print(f"Stored trade for MT5 to pick up: {latest_trade}")
-        
-        return jsonify({"status": "success", "message": "Trade logged successfully"}), 200
+        try:
+            formatted_trade = format_trade_for_mt5(trade_data)
+            trade_queue.append(formatted_trade)
+            print(f"Stored trade for MT5 to pick up: {formatted_trade}")
+            return jsonify({"status": "success", "message": "Trade logged successfully"}), 200
+        except ValueError as e:
+            error_msg = str(e)
+            print(f"Validation error: {error_msg}")
+            return jsonify({"status": "error", "message": error_msg}), 400
+        except Exception as e:
+            error_msg = f"Error formatting trade: {str(e)}"
+            print(error_msg)
+            return jsonify({"status": "error", "message": error_msg}), 500
             
     except Exception as e:
-        print(f"Error handling trade: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        error_msg = f"Error handling trade: {str(e)}"
+        print(error_msg)
+        return jsonify({"status": "error", "message": error_msg}), 500
 
 @app.route('/mt5/get_trade', methods=['GET'])
 def get_trade():
-    global latest_trade
     try:
         print("\n=== Received GET to /mt5/get_trade ===")
-        if latest_trade:
-            print(f"Sending trade to MT5: {latest_trade}")
-            response = latest_trade
-            latest_trade = None  # Clear the trade after sending
-            return jsonify(response), 200
+        if trade_queue:
+            trade = trade_queue.popleft()
+            print(f"Sending trade to MT5: {trade}")
+            return jsonify(trade), 200
         else:
             print("No trade waiting")
             return jsonify({"status": "no_trade"}), 200

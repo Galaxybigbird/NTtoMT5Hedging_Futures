@@ -1,6 +1,6 @@
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.34"
+#property version   "1.35"
 #property strict
 #property description "Hedge Receiver EA for NinjaTrader trades"
 
@@ -38,122 +38,254 @@ public:
         }
     }
     
-    // Get string value between quotes
-    string GetStringValue()
+    // Parse a string value
+    bool ParseString(string &value)
     {
-        string result = "";
-        pos++; // Skip opening quote
+        if(pos >= StringLen(json_str)) return false;
         
+        SkipWhitespace();
+        
+        // Must start with quote
+        if(StringGetCharacter(json_str, pos) != '"')
+            return false;
+        pos++;
+        
+        value = "";
         while(pos < StringLen(json_str))
         {
             ushort ch = StringGetCharacter(json_str, pos);
             if(ch == '"')
-                break;
-            result += ShortToString(ch);
+            {
+                pos++;
+                return true;
+            }
+            value += ShortToString(ch);
             pos++;
         }
-        pos++; // Skip closing quote
-        return result;
+        return false;
     }
     
-    // Get numeric value
-    double GetNumericValue()
+    // Parse a number value
+    bool ParseNumber(double &value)
     {
-        string num = "";
-        string validChars = "0123456789.-";
+        if(pos >= StringLen(json_str)) return false;
         
-        while(pos < StringLen(json_str))
-        {
-            ushort ch = StringGetCharacter(json_str, pos);
-            string chStr = ShortToString(ch);
-            if(StringFind(validChars, chStr) < 0)
-                break;
-            num += chStr;
-            pos++;
-        }
-        return StringToDouble(num);
-    }
-    
-    // Get boolean value
-    bool GetBooleanValue()
-    {
-        string val = "";
         SkipWhitespace();
         
-        while(pos < StringLen(json_str))
+        string num = "";
+        bool hasDecimal = false;
+        
+        // Optional minus sign
+        if(StringGetCharacter(json_str, pos) == '-')
         {
-            ushort ch = StringGetCharacter(json_str, pos);
-            string chStr = ShortToString(ch);
-            if(chStr == "," || chStr == "}")
-                break;
-            val += chStr;
+            num += "-";
             pos++;
         }
         
-        // Trim whitespace manually since StringTrim functions are member functions
-        while(StringLen(val) > 0 && StringGetCharacter(val, 0) <= ' ')
-            val = StringSubstr(val, 1);
-        while(StringLen(val) > 0 && StringGetCharacter(val, StringLen(val)-1) <= ' ')
-            val = StringSubstr(val, 0, StringLen(val)-1);
-            
-        Print("Parsing boolean value: ", val);
-        return StringCompare(val, "true", false) == 0;
+        while(pos < StringLen(json_str))
+        {
+            ushort ch = StringGetCharacter(json_str, pos);
+            if(ch >= '0' && ch <= '9')
+            {
+                num += ShortToString(ch);
+            }
+            else if(ch == '.' && !hasDecimal)
+            {
+                num += ".";
+                hasDecimal = true;
+            }
+            else
+                break;
+            pos++;
+        }
+        
+        value = StringToDouble(num);
+        return true;
     }
     
-    // Parse JSON object and extract values
-    bool ParseObject(string &out_symbol, string &out_type, 
-                    double &out_volume, double &out_price, string &out_comment,
-                    bool &out_is_close)
+    // Parse a boolean value
+    bool ParseBool(bool &value)
     {
+        if(pos >= StringLen(json_str)) return false;
+        
+        SkipWhitespace();
+        
+        if(pos + 4 <= StringLen(json_str) && StringSubstr(json_str, pos, 4) == "true")
+        {
+            value = true;
+            pos += 4;
+            return true;
+        }
+        
+        if(pos + 5 <= StringLen(json_str) && StringSubstr(json_str, pos, 5) == "false")
+        {
+            value = false;
+            pos += 5;
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Skip a value (string, number, boolean, null, object, or array)
+    void SkipValue()
+    {
+        SkipWhitespace();
+        
+        if(pos >= StringLen(json_str)) return;
+        
         ushort ch = StringGetCharacter(json_str, pos);
-        if(ch != '{') return false;
-        pos++; // Skip opening brace
+        
+        if(ch == '"')  // String
+        {
+            pos++;
+            while(pos < StringLen(json_str))
+            {
+                if(StringGetCharacter(json_str, pos) == '"')
+                {
+                    pos++;
+                    break;
+                }
+                pos++;
+            }
+        }
+        else if(ch == '{')  // Object
+        {
+            int depth = 1;
+            pos++;
+            while(pos < StringLen(json_str) && depth > 0)
+            {
+                ch = StringGetCharacter(json_str, pos);
+                if(ch == '{') depth++;
+                if(ch == '}') depth--;
+                pos++;
+            }
+        }
+        else if(ch == '[')  // Array
+        {
+            int depth = 1;
+            pos++;
+            while(pos < StringLen(json_str) && depth > 0)
+            {
+                ch = StringGetCharacter(json_str, pos);
+                if(ch == '[') depth++;
+                if(ch == ']') depth--;
+                pos++;
+            }
+        }
+        else if(ch == 't' || ch == 'f')  // true or false
+        {
+            while(pos < StringLen(json_str))
+            {
+                ch = StringGetCharacter(json_str, pos);
+                if(ch == ',' || ch == '}' || ch == ']') break;
+                pos++;
+            }
+        }
+        else if(ch == 'n')  // null
+        {
+            pos += 4;  // Skip "null"
+        }
+        else  // Number
+        {
+            while(pos < StringLen(json_str))
+            {
+                ch = StringGetCharacter(json_str, pos);
+                if(ch == ',' || ch == '}' || ch == ']') break;
+                pos++;
+            }
+        }
+    }
+    
+    // Parse the entire trade object
+    bool ParseObject(string &symbol, string &type, double &volume, double &price, string &comment, bool &is_close)
+    {
+        if(pos >= StringLen(json_str)) return false;
+        
+        SkipWhitespace();
+        
+        // Must start with {
+        if(StringGetCharacter(json_str, pos) != '{')
+            return false;
+        pos++;
+        
+        // Initialize required field flags
+        bool has_symbol = false;
+        bool has_type = false;
+        bool has_volume = false;
+        bool has_price = false;
+        bool has_comment = false;
+        bool has_is_close = false;
         
         while(pos < StringLen(json_str))
         {
             SkipWhitespace();
-            ch = StringGetCharacter(json_str, pos);
-            if(ch != '"') return false;
             
-            string key = GetStringValue();
+            // Check for end of object
+            if(StringGetCharacter(json_str, pos) == '}')
+            {
+                pos++;
+                // Verify all required fields were found
+                return has_symbol && has_type && has_volume && has_price && has_comment && has_is_close;
+            }
+            
+            // Parse the key
+            string key;
+            if(!ParseString(key))
+                return false;
+                
             SkipWhitespace();
             
-            ch = StringGetCharacter(json_str, pos);
-            if(ch != ':') return false;
-            pos++; // Skip colon
-            SkipWhitespace();
+            // Must have a colon
+            if(StringGetCharacter(json_str, pos) != ':')
+                return false;
+            pos++;
             
+            // Parse the value based on the key
             if(key == "symbol")
-                out_symbol = GetStringValue();
+            {
+                if(!ParseString(symbol)) return false;
+                has_symbol = true;
+            }
             else if(key == "type")
-                out_type = GetStringValue();
+            {
+                if(!ParseString(type)) return false;
+                has_type = true;
+            }
             else if(key == "volume")
-                out_volume = GetNumericValue();
+            {
+                if(!ParseNumber(volume)) return false;
+                has_volume = true;
+            }
             else if(key == "price")
-                out_price = GetNumericValue();
+            {
+                if(!ParseNumber(price)) return false;
+                has_price = true;
+            }
             else if(key == "comment")
-                out_comment = GetStringValue();
+            {
+                if(!ParseString(comment)) return false;
+                has_comment = true;
+            }
             else if(key == "is_close")
-                out_is_close = GetBooleanValue();
+            {
+                if(!ParseBool(is_close)) return false;
+                has_is_close = true;
+            }
             else
             {
-                // Skip unknown values
-                while(pos < StringLen(json_str))
-                {
-                    ch = StringGetCharacter(json_str, pos);
-                    if(ch == ',' || ch == '}')
-                        break;
-                    pos++;
-                }
+                // Skip unknown field value
+                SkipValue();
             }
             
             SkipWhitespace();
-            ch = StringGetCharacter(json_str, pos);
-            if(ch == '}') break;
-            if(ch == ',') pos++;
+            
+            // Skip comma if present
+            if(StringGetCharacter(json_str, pos) == ',')
+                pos++;
         }
         
-        return true;
+        return false;  // Reached end of input without finding closing }
     }
 };
 
@@ -312,7 +444,9 @@ void OnTimer()
       }
       else
       {
-         Print("No positions found to close");
+         Print("No positions found to close, proceeding to open new position");
+         // Continue to open new position since there was nothing to close
+         is_close = false;  // Reset is_close flag since we're opening a new position
       }
    }
    else
