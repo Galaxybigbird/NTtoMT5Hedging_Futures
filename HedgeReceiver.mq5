@@ -621,15 +621,33 @@ string GetTradeFromBridge()
    
    if(web_result == -1)
    {
-      Print("Error in WebRequest. Error code: ", GetLastError());
+      int error = GetLastError();
+      Print("Error in WebRequest. Error code: ", error);
+      if(error == ERR_WEBREQUEST_INVALID_ADDRESS) Print("Invalid URL. Check BridgeURL setting.");
+      if(error == ERR_WEBREQUEST_CONNECT_FAILED) Print("Connection failed. Check if Bridge server is running.");
       return "";
    }
    
    string response_str = CharArrayToString(response_data);
+   Print("Response: ", response_str);
+   
+   // Check if response is HTML (indicates error page)
+   if(StringFind(response_str, "<!doctype html>") >= 0 || StringFind(response_str, "<html") >= 0)
+   {
+      Print("Received HTML error page instead of JSON");
+      return "";
+   }
    
    // Check for no trades
    if(StringFind(response_str, "no_trade") >= 0)
    {
+      return "";
+   }
+   
+   // Validate JSON response
+   if(StringFind(response_str, "{") < 0 || StringFind(response_str, "}") < 0)
+   {
+      Print("Invalid JSON response");
       return "";
    }
    

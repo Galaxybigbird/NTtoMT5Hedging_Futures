@@ -5,7 +5,7 @@ from collections import deque
 
 app = Flask(__name__)
 
-# Store trades in a queue for MT5 to pick up
+# Initialize trade queue as a global variable
 trade_queue = deque()
 
 # Symbol mapping from NinjaTrader to MT5
@@ -135,16 +135,26 @@ def log_trade():
 def get_trade():
     try:
         print("\n=== Received GET to /mt5/get_trade ===")
-        if trade_queue:
+        print(f"Current queue size: {len(trade_queue)}")
+        
+        if len(trade_queue) == 0:
+            print("No trades in queue")
+            return jsonify({"status": "no_trade"}), 200
+            
+        try:
             trade = trade_queue.popleft()
             print(f"Sending trade to MT5: {trade}")
             return jsonify(trade), 200
-        else:
-            print("No trade waiting")
-            return jsonify({"status": "no_trade"}), 200
+        except Exception as e:
+            print(f"Error getting trade from queue: {str(e)}")
+            return jsonify({"status": "error", "message": f"Queue error: {str(e)}"}), 500
+            
     except Exception as e:
-        print(f"Error in get_trade: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        error_msg = f"Error in get_trade: {str(e)}"
+        print(f"Critical error: {error_msg}")
+        print(f"Exception type: {type(e)}")
+        print(f"Exception args: {e.args}")
+        return jsonify({"status": "error", "message": error_msg}), 500
 
 @app.route('/mt5/trade_result', methods=['POST'])
 def trade_result():
@@ -169,7 +179,10 @@ def trade_result():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy"}), 200
+    try:
+        return jsonify({"status": "healthy", "queue_size": len(trade_queue)}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
 if __name__ == '__main__':
     print("\nStarting Bridge Server...")
