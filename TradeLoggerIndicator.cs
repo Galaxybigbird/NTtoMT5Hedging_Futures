@@ -1,38 +1,60 @@
 #region Using declarations
+// Core .NET libraries for HTTP communication and text handling
 using System;
 using System.Net.Http;
 using System.Text;
 using System.Collections.Generic;
-using NinjaTrader.Cbi;
-using NinjaTrader.Gui;
-using NinjaTrader.Gui.Chart;
-using NinjaTrader.Data;
-using NinjaTrader.NinjaScript;
-using NinjaTrader.Core.FloatingPoint;
-using System.ComponentModel;
-using System.ComponentModel.DataAnnotations;
-using System.Windows.Media;
-using System.Windows;
-using NinjaTrader.Gui.Tools;
-using NinjaTrader.NinjaScript.DrawingTools;
+using System.Linq;  // Add this for FirstOrDefault
+using System.Threading.Tasks;
 
+// NinjaTrader specific imports for trading functionality
+using NinjaTrader.Cbi;              // Core Business Intelligence
+using NinjaTrader.Gui;             // GUI components
+using NinjaTrader.Gui.Chart;       // Charting components
+using NinjaTrader.Data;            // Data handling
+using NinjaTrader.NinjaScript;     // NinjaScript base functionality
+using NinjaTrader.Core.FloatingPoint; // Floating point operations
+using System.ComponentModel;        // Component model for properties
+using System.ComponentModel.DataAnnotations; // Data annotations
+using System.Windows.Media;         // WPF media functionality
+using System.Windows;               // WPF core
+using NinjaTrader.Gui.Tools;       // NinjaTrader tools
+using NinjaTrader.NinjaScript.DrawingTools; // Drawing tools for charts
 #endregion
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
+    // Class to track individual trade positions
+    public class TradePosition
+    {
+        public string TradeId { get; set; }  // Add unique trade ID
+        public long OrderId { get; set; }
+        public string Instrument { get; set; }
+        public OrderAction Action { get; set; }
+        public double Quantity { get; set; }
+        public double Price { get; set; }
+        public DateTime EntryTime { get; set; }
+    }
+
+    // Main indicator class that logs trade executions to a Python server
     public class TradeLoggerIndicator : Indicator
     {
-        private Account selectedAccount;
-        private bool statusTextDrawn;
-        private readonly HttpClient httpClient;
+        // Private member variables
+        private Account selectedAccount;           // Currently selected trading account
+        private bool statusTextDrawn;             // Flag to track if status text is drawn on chart
+        private readonly HttpClient httpClient;    // HTTP client for API communication
+        private Dictionary<string, List<TradePosition>> activePositions = new Dictionary<string, List<TradePosition>>(); // Tracks active positions by instrument
 
+        // Constructor initializes the HTTP client
         public TradeLoggerIndicator()
         {
             httpClient = new HttpClient();
         }
 
+        // Account name storage
         private string accountName = string.Empty;
         
+        // Property for account selection in the indicator settings
         [NinjaScriptProperty]
         [Display(Name = "Account", GroupName = "Parameters", Order = 0)]
         [TypeConverter(typeof(AccountNameConverter))]
@@ -42,8 +64,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             set
             {
                 accountName = value;
+                // Only process during setup phases
                 if (State == State.SetDefaults || State == State.Configure)
                 {
+                    // Find and set the selected account object
                     if (Account.All != null)
                     {
                         foreach (Account acc in Account.All)
@@ -59,9 +83,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        // Custom TypeConverter for Account dropdown
+        // Custom converter class to provide account selection dropdown
         public class AccountNameConverter : TypeConverter
         {
+            // Returns list of available account names
             public override StandardValuesCollection GetStandardValues(ITypeDescriptorContext context)
             {
                 List<string> accountNames = new List<string>();
@@ -79,26 +104,31 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return new StandardValuesCollection(accountNames);
             }
 
+            // Enable dropdown list
             public override bool GetStandardValuesSupported(ITypeDescriptorContext context)
             {
                 return true;
             }
 
+            // Make dropdown list exclusive (no manual entry)
             public override bool GetStandardValuesExclusive(ITypeDescriptorContext context)
             {
                 return true;
             }
         }
 
+        // Property for Go bridge server URL configuration
         [NinjaScriptProperty]
-        [Display(Name = "Python Server URL", GroupName = "Parameters", Order = 1)]
-        public string PythonServerUrl { get; set; } = "http://localhost:5000/log_trade";
+        [Display(Name = "Bridge Server URL", GroupName = "Parameters", Order = 1)]
+        public string BridgeServerUrl { get; set; } = "http://127.0.0.1:5000/log_trade";
 
+        // Handles state changes in the indicator lifecycle
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
-                Description = "Logs executed trades for this instrument to a Python server.";
+                // Initialize default settings
+                Description = "Logs executed trades for this instrument to the Go bridge server.";
                 Name = "TradeLoggerIndicator";
                 IsOverlay = true;
             }
@@ -112,6 +142,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Print("Available accounts:");
                 
                 bool foundAny = false;
+                // List all connected accounts
                 foreach (Account acc in Account.All)
                 {
                     // Only check connected/active accounts
@@ -127,20 +158,23 @@ namespace NinjaTrader.NinjaScript.Indicators
                     }
                 }
                 
+                // Warning if no accounts found
                 if (!foundAny)
                 {
                     Print("WARNING: No connected accounts found!");
                 }
 
+                // Error if selected account not found
                 if (selectedAccount == null)
                 {
                     Print($"ERROR: Account '{AccountName}' not found in available accounts!");
                     return;
                 }
 
-                Print($"Python Server URL: {PythonServerUrl}");
+                Print($"Python Server URL: {BridgeServerUrl}");
                 Print("=======================================");
 
+                // Subscribe to execution updates
                 selectedAccount.ExecutionUpdate += OnExecutionUpdate;
             }
             else if (State == State.DataLoaded)
@@ -157,6 +191,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Terminated)
             {
+                // Cleanup on termination
                 Print("TradeLoggerIndicator: Terminating");
                 if (selectedAccount != null)
                 {
@@ -169,6 +204,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        // Called on each bar update
         protected override void OnBarUpdate()
         {
             if (State == State.Realtime && !statusTextDrawn)
@@ -183,17 +219,27 @@ namespace NinjaTrader.NinjaScript.Indicators
                     0);
                 
                 statusTextDrawn = true;
+                // Output status information
                 Print("====== TradeLoggerIndicator Status ======");
                 Print($"Account being monitored: '{AccountName}'");
                 Print($"Instrument being monitored: {Instrument.FullName}");
-                Print($"Python Server URL: {PythonServerUrl}");
+                Print($"Bridge Server URL: {BridgeServerUrl}");
                 Print("Trade Logger Indicator started and ready to monitor trades.");
                 Print("=========================================");
             }
         }
 
+        private string GenerateTradeId()
+        {
+            // Generate a unique base trade ID using timestamp and random number
+            Random random = new Random();  // Create Random instance here
+            return DateTime.UtcNow.Ticks.ToString("x") + "_" + random.Next(1000, 9999).ToString();
+        }
+
+        // Handles trade execution updates
         private async void OnExecutionUpdate(object sender, ExecutionEventArgs e)
         {
+            // Debug output for execution details
             Print($"====== Execution Update Received ======");
             Print($"Execution Account: {e.Execution.Account.Name}");
             Print($"Execution Instrument: {e.Execution.Instrument.FullName}");
@@ -203,69 +249,68 @@ namespace NinjaTrader.NinjaScript.Indicators
             Print($"Order Quantity: {e.Execution.Quantity}");
             Print($"Order Price: {e.Execution.Price}");
 
+            // Skip if execution is for a different instrument
             if (e.Execution.Instrument.FullName != Instrument.FullName)
             {
                 Print("Skipping - different instrument");
                 return;
             }
 
-            // Process both Working and Filled orders
-            if (e.Execution.Order.OrderState == OrderState.Filled || e.Execution.Order.OrderState == OrderState.Working)
+            // Process Filled orders
+            if (e.Execution.Order.OrderState == OrderState.Filled)
             {
-                Print($"Processing {e.Execution.Order.OrderState} order");
-                // Get the current position for this instrument from the account's positions
-                Position position = null;
-                foreach (Position pos in e.Execution.Account.Positions)
+                string baseTradeId = GenerateTradeId();
+                Print($"Generated base Trade ID: {baseTradeId}");
+
+                // For multi-contract trades, we'll send one message per contract
+                int numContracts = (int)e.Execution.Quantity;
+                Print($"Processing {numContracts} contract(s)");
+
+                for (int i = 0; i < numContracts; i++)
                 {
-                    Print($"Checking position - Instrument: {pos.Instrument.FullName}, Quantity: {pos.Quantity}");
-                    if (pos.Instrument == e.Execution.Instrument)
+                    string tradeId = numContracts > 1 ? $"{baseTradeId}_{i + 1}" : baseTradeId;
+                    Print($"Processing contract {i + 1} with Trade ID: {tradeId}");
+
+                    // Create trade data object
+                    var tradeData = new Dictionary<string, object>
                     {
-                        position = pos;
-                        Print("Found matching position");
-                        break;
-                    }
-                }
-                
-                // Determine if this is an exit order by checking if it reduces/closes a position
-                bool isExit = false;
-                if (position != null)
-                {
-                    isExit = (e.Execution.Order.OrderAction == OrderAction.Buy && position.Quantity < 0) ||  // Buying to close short
-                             (e.Execution.Order.OrderAction == OrderAction.Sell && position.Quantity > 0);   // Selling to close long
-                }
+                        { "id", tradeId },
+                        { "base_id", baseTradeId }, // Include base ID for correlation
+                        { "time", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }, // Format time in UTC with proper format
+                        { "action", e.Execution.Order.OrderAction.ToString() },
+                        { "quantity", 1.0 }, // Always 1 since we're sending individual contract messages
+                        { "price", e.Execution.Price },
+                        { "total_quantity", numContracts }, // Include total quantity for reference
+                        { "contract_num", i + 1 } // Which contract this is in the sequence
+                    };
 
-                Print($"Order Action: {e.Execution.Order.OrderAction}, Position Quantity: {position?.Quantity}, IsExit: {isExit}");
-
-                var tradeData = new
-                {
-                    time = e.Execution.Time.ToString("o"),
-                    instrument = e.Execution.Instrument.MasterInstrument.Name,
-                    action = e.Execution.Order.OrderAction.ToString(),
-                    quantity = e.Execution.Quantity,
-                    price = e.Execution.Price,
-                    account = e.Execution.Account.Name,
-                    is_exit = isExit
-                };
-
-                try
-                {
-                    string jsonData = SimpleJson.SerializeObject(tradeData);
-                    Print($"Sending trade data to Python server: {jsonData}");
-                    var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
-
-                    var response = await httpClient.PostAsync(PythonServerUrl, content);
-                    if (response.IsSuccessStatusCode)
+                    try
                     {
-                        Print($"TradeLoggerIndicator: Trade sent to Python server successfully");
+                        // Convert trade data to JSON
+                        string jsonData = SimpleJson.SerializeObject(tradeData);
+                        Print($"Sending trade data: {jsonData}");
+
+                        // Send to bridge server
+                        var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
+                        var response = await httpClient.PostAsync(BridgeServerUrl, content);
+
+                        // Check response
+                        if (response.IsSuccessStatusCode)
+                        {
+                            Print($"Trade logged successfully. Trade ID: {tradeId}");
+                        }
+                        else
+                        {
+                            Print($"Error logging trade: {response.StatusCode} - {response.ReasonPhrase}");
+                        }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        Print($"TradeLoggerIndicator: Failed to send trade to Python server. Status: {response.StatusCode}");
+                        Print($"Error sending trade data: {ex.Message}");
                     }
-                }
-                catch (Exception ex)
-                {
-                    Print($"TradeLoggerIndicator: Error sending trade to Python server - {ex.Message}");
+
+                    // Small delay between sending multiple contracts to ensure order
+                    if (numContracts > 1) await Task.Delay(100);
                 }
             }
             else
@@ -274,15 +319,85 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             Print("======================================");
         }
+
+        // Determines if an execution is closing an existing position
+        private bool IsExitForPosition(ExecutionEventArgs e)
+        {
+            string instrumentKey = e.Execution.Instrument.FullName;
+            
+            // Initialize position tracking if not already done
+            if (!activePositions.ContainsKey(instrumentKey))
+            {
+                activePositions[instrumentKey] = new List<TradePosition>();
+                return false;
+            }
+
+            var positions = activePositions[instrumentKey];
+            
+            // Check if this execution closes any specific position
+            if (e.Execution.Order.OrderAction == OrderAction.Buy)
+            {
+                // Look for matching short positions to close
+                var matchingPosition = positions.FirstOrDefault(p => 
+                    p.Action == OrderAction.Sell && 
+                    p.Quantity == e.Execution.Quantity);
+                    
+                if (matchingPosition != null)
+                {
+                    positions.Remove(matchingPosition);
+                    return true;
+                }
+            }
+            else if (e.Execution.Order.OrderAction == OrderAction.Sell)
+            {
+                // Look for matching long positions to close
+                var matchingPosition = positions.FirstOrDefault(p => 
+                    p.Action == OrderAction.Buy && 
+                    p.Quantity == e.Execution.Quantity);
+                    
+                if (matchingPosition != null)
+                {
+                    positions.Remove(matchingPosition);
+                    return true;
+                }
+            }
+
+            // Add new position if not closing existing one
+            positions.Add(new TradePosition
+            {
+                OrderId = e.Execution.Order.Id,
+                Instrument = e.Execution.Instrument.FullName,
+                Action = e.Execution.Order.OrderAction,
+                Quantity = e.Execution.Quantity,
+                Price = e.Execution.Price,
+                EntryTime = e.Execution.Time
+            });
+            
+            return false;
+        }
     }
 
-    // Simple JSON serializer to avoid external dependencies
+    // Simple JSON serializer implementation to avoid external dependencies
     internal static class SimpleJson
     {
+        // Serializes an object to JSON string
         public static string SerializeObject(object obj)
         {
             if (obj == null) return "null";
             
+            // Handle Dictionary<string, object> specially
+            if (obj is Dictionary<string, object> dict)
+            {
+                var pairs = new List<string>();
+                foreach (var kvp in dict)
+                {
+                    var serializedValue = SerializeValue(kvp.Value);
+                    pairs.Add($"\"{kvp.Key}\":{serializedValue}");
+                }
+                return "{" + string.Join(",", pairs) + "}";
+            }
+            
+            // Handle regular objects
             var properties = obj.GetType().GetProperties();
             var jsonPairs = new string[properties.Length];
             
@@ -297,12 +412,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             return "{" + string.Join(",", jsonPairs) + "}";
         }
 
+        // Helper method to serialize different value types
         private static string SerializeValue(object value)
         {
             if (value == null) return "null";
             if (value is string) return $"\"{value}\"";
             if (value is bool) return value.ToString().ToLower();
             if (value is DateTime dt) return $"\"{dt:o}\"";
+            if (value is int || value is long || value is float || value is double) return value.ToString();
+            if (value is Dictionary<string, object>) return SerializeObject(value);
             if (value.GetType().IsValueType) return value.ToString();
             return SerializeObject(value);
         }

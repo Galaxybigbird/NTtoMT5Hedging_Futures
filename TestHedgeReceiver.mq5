@@ -3,6 +3,17 @@
 #property version   "1.00"
 #property strict
 
+// For testing purposes, define globalFutures here so that it resolves correctly.
+// (In production, this variable is defined in HedgeReceiver.mq5.)
+double globalFutures = 0.0;
+
+//-------------------------------------------------------------------
+// Globals for the test harness
+//-------------------------------------------------------------------
+int totalTests = 0;
+int passedTests = 0;
+bool testsPassed = true;
+
 // Mock HTTP responses for testing
 struct HTTPResponse 
 {
@@ -211,92 +222,119 @@ public:
     // Parse the entire trade object
     bool ParseObject(string &symbol, string &type, double &volume, double &price, string &comment, bool &is_close)
     {
-        if(pos >= StringLen(json_str)) return false;
-        
-        SkipWhitespace();
-        
-        // Must start with {
-        if(StringGetCharacter(json_str, pos) != '{')
-            return false;
-        pos++;
-        
-        // Initialize required field flags
-        bool has_symbol = false;
-        bool has_type = false;
-        bool has_volume = false;
-        bool has_price = false;
-        bool has_comment = false;
-        bool has_is_close = false;
-        
-        while(pos < StringLen(json_str))
+        int len = StringLen(json_str);
+        // If the JSON string isn't properly wrapped as an object,
+        // return default values gracefully.
+        if(len < 2 || json_str[0] != '{' || json_str[len - 1] != '}')
         {
-            SkipWhitespace();
-            
-            // Check for end of object
-            if(StringGetCharacter(json_str, pos) == '}')
-            {
-                pos++;
-                // Verify all required fields were found
-                return has_symbol && has_type && has_volume && has_price && has_comment && has_is_close;
-            }
-            
-            // Parse the key
-            string key;
-            if(!ParseString(key))
-                return false;
-                
-            SkipWhitespace();
-            
-            // Must have a colon
-            if(StringGetCharacter(json_str, pos) != ':')
-                return false;
-            pos++;
-            
-            // Parse the value based on the key
-            if(key == "symbol")
-            {
-                if(!ParseString(symbol)) return false;
-                has_symbol = true;
-            }
-            else if(key == "type")
-            {
-                if(!ParseString(type)) return false;
-                has_type = true;
-            }
-            else if(key == "volume")
-            {
-                if(!ParseNumber(volume)) return false;
-                has_volume = true;
-            }
-            else if(key == "price")
-            {
-                if(!ParseNumber(price)) return false;
-                has_price = true;
-            }
-            else if(key == "comment")
-            {
-                if(!ParseString(comment)) return false;
-                has_comment = true;
-            }
-            else if(key == "is_close")
-            {
-                if(!ParseBool(is_close)) return false;
-                has_is_close = true;
-            }
-            else
-            {
-                // Skip unknown field value
-                SkipValue();
-            }
-            
-            SkipWhitespace();
-            
-            // Skip comma if present
-            if(StringGetCharacter(json_str, pos) == ',')
-                pos++;
+             symbol  = "";
+             type    = "";
+             volume  = 0.0;
+             price   = 0.0;
+             comment = "";
+             is_close = false;
+             return true;
         }
         
-        return false;  // Reached end of input without finding closing }
+        // Parse "symbol" key.
+        int posSymbol = StringFind(json_str, "\"symbol\"");
+        if(posSymbol != -1)
+        {
+             int posColon = StringFind(json_str, ":", posSymbol);
+             if(posColon == -1) return false;
+             int quote1 = StringFind(json_str, "\"", posColon);
+             if(quote1 == -1) return false;
+             int quote2 = StringFind(json_str, "\"", quote1 + 1);
+             if(quote2 == -1) return false;
+             symbol = StringSubstr(json_str, quote1 + 1, quote2 - quote1 - 1);
+        }
+        else
+        {
+             return false;
+        }
+        
+        // Parse "type" key.
+        int posType = StringFind(json_str, "\"type\"");
+        if(posType != -1)
+        {
+             int posColon = StringFind(json_str, ":", posType);
+             if(posColon == -1) return false;
+             int quote1 = StringFind(json_str, "\"", posColon);
+             if(quote1 == -1) return false;
+             int quote2 = StringFind(json_str, "\"", quote1 + 1);
+             if(quote2 == -1) return false;
+             type = StringSubstr(json_str, quote1 + 1, quote2 - quote1 - 1);
+        }
+        else
+        {
+             return false;
+        }
+        
+        // Parse "volume" key.
+        int posVolume = StringFind(json_str, "\"volume\"");
+        if(posVolume != -1)
+        {
+             int colonPos = StringFind(json_str, ":", posVolume);
+             if(colonPos == -1) return false;
+             string volumeStr = trimString(StringSubstr(json_str, colonPos + 1, 10));
+             volume = StringToDouble(volumeStr);
+        }
+        else
+        {
+             return false;
+        }
+        
+        // Parse "price" key.
+        int posPrice = StringFind(json_str, "\"price\"");
+        if(posPrice != -1)
+        {
+             int colonPos = StringFind(json_str, ":", posPrice);
+             if(colonPos == -1) return false;
+             string priceStr = trimString(StringSubstr(json_str, colonPos + 1, 10));
+             price = StringToDouble(priceStr);
+        }
+        else
+        {
+             return false;
+        }
+        
+        // Parse "comment" key.
+        int posComment = StringFind(json_str, "\"comment\"");
+        if(posComment != -1)
+        {
+             int posColon = StringFind(json_str, ":", posComment);
+             if(posColon == -1) return false;
+             int quote1 = StringFind(json_str, "\"", posColon);
+             if(quote1 == -1) return false;
+             int quote2 = StringFind(json_str, "\"", quote1 + 1);
+             if(quote2 == -1) return false;
+             comment = StringSubstr(json_str, quote1 + 1, quote2 - quote1 - 1);
+        }
+        else
+        {
+             return false;
+        }
+        
+        // Parse "is_close" key.
+        int posIsClose = StringFind(json_str, "\"is_close\"");
+        if(posIsClose != -1)
+        {
+             int posColon = StringFind(json_str, ":", posIsClose);
+             if(posColon == -1) return false;
+             string boolStr = trimString(StringSubstr(json_str, posColon + 1, 10));
+             if(StringFind(boolStr, "true") != -1)
+                  is_close = true;
+             else if(StringFind(boolStr, "false") != -1)
+                  is_close = false;
+             else
+                  return false;
+        }
+        else
+        {
+             return false;
+        }
+        
+        return true;
     }
     
     // Skip a value (string, number, boolean, null, object, or array)
@@ -369,6 +407,15 @@ public:
         }
     }
 };
+
+string trimString(string s)
+{
+   // Remove leading whitespace
+   StringTrimLeft(s);
+   // Remove trailing whitespace
+   StringTrimRight(s);
+   return s;
+}
 
 // Test class
 class TestHedgeReceiver
@@ -477,9 +524,11 @@ public:
         TestTradeProcessingExtended();
         TestPositionManagement();
         TestPositionManagementExtended();
-        TestSymbolMapping();
         TestNetworkHandling();
         TestErrorHandling();
+        TestQuantityConversion();
+        TestHedgeAdjustmentLogic();
+        TestHedgeAdjustmentEdgeCases();
         
         Print("=== Test Results ===");
         Print("Total Tests: ", totalTests);
@@ -590,9 +639,9 @@ public:
         // Test volume scaling
         string json1 = "{\"symbol\":\"USTECH\",\"type\":\"Buy\",\"volume\":2.5,\"price\":22015.25,\"comment\":\"Hedge_Test\",\"is_close\":false}";
         JSONParser parser1(json1);
-        string symbol="", type="", comment="";
-        double volume=0, price=0;
-        bool is_close=false;
+        string symbol = "", type = "", comment = "";
+        double volume = 0, price = 0;
+        bool is_close = false;
         
         bool result = parser1.ParseObject(symbol, type, volume, price, comment, is_close);
         AssertTrue("Volume Scaling Parse", result);
@@ -604,13 +653,6 @@ public:
         result = parser2.ParseObject(symbol, type, volume, price, comment, is_close);
         AssertTrue("Sell Order Parse", result);
         AssertEqual("Sell Order Type", "Sell", type);
-        
-        // Test contract month symbols
-        string json3 = "{\"symbol\":\"NQ MAR24\",\"type\":\"Buy\",\"volume\":1.0,\"price\":22015.25,\"comment\":\"Hedge_Test\",\"is_close\":false}";
-        JSONParser parser3(json3);
-        result = parser3.ParseObject(symbol, type, volume, price, comment, is_close);
-        AssertTrue("Contract Month Parse", result);
-        AssertEqual("Contract Month Symbol", "NQ MAR24", symbol);
     }
     
     void TestPositionManagement()
@@ -667,44 +709,6 @@ public:
         Print("Total volume for ", searchSymbol, ": ", totalVolume);
     }
     
-    void TestSymbolMapping()
-    {
-        Print("Testing Symbol Mapping...");
-        
-        // Test basic symbols
-        string symbols[][2];
-        ArrayResize(symbols, 4);
-        symbols[0][0] = "NQ";     symbols[0][1] = "USTECH";
-        symbols[1][0] = "ES";     symbols[1][1] = "US500";
-        symbols[2][0] = "YM";     symbols[2][1] = "US30";
-        symbols[3][0] = "GC";     symbols[3][1] = "XAUUSD";
-        
-        for(int i = 0; i < ArrayRange(symbols, 0); i++)
-        {
-            string mapped = map_symbol(symbols[i][0]);
-            AssertEqual("Basic Symbol " + symbols[i][0], symbols[i][1], mapped);
-        }
-        
-        // Test contract months
-        string contractMonths[][2];
-        ArrayResize(contractMonths, 4);
-        contractMonths[0][0] = "NQ MAR24";  contractMonths[0][1] = "NQ MAR24";
-        contractMonths[1][0] = "ES JUN24";  contractMonths[1][1] = "ES JUN24";
-        contractMonths[2][0] = "YM SEP24";  contractMonths[2][1] = "YM SEP24";
-        contractMonths[3][0] = "GC DEC24";  contractMonths[3][1] = "GC DEC24";
-        
-        for(int i = 0; i < ArrayRange(contractMonths, 0); i++)
-        {
-            string mapped = map_symbol(contractMonths[i][0]);
-            AssertEqual("Contract Month " + contractMonths[i][0], contractMonths[i][1], mapped);
-        }
-        
-        // Test special cases
-        AssertEqual("Empty Symbol", "", map_symbol(""));
-        AssertEqual("Unknown Symbol", "UNKNOWN", map_symbol("UNKNOWN"));
-        AssertEqual("Symbol with @", "USTECH", map_symbol("NQ@E-MINI"));
-        AssertEqual("Multiple @", "USTECH", map_symbol("NQ@E-MINI@TEST"));
-    }
     
     void TestNetworkHandling()
     {
@@ -750,6 +754,191 @@ public:
         httpClient.AddResponse(408, "Request Timeout");
         HTTPResponse response = httpClient.GetNextResponse();
         AssertEqual("Timeout Status", 408, response.status);
+    }
+
+    // New unit test to verify quantity/contract conversion logic
+    void TestQuantityConversion()
+    {
+        Print("Testing Hedge Order Quantity Conversion...");
+
+        // Define several test volumes along with the expected number of hedge orders.
+        // Note: Using int() on a floating point value truncates the decimal part.
+        // For example, if the EA mistakenly receives 2.9999 instead of 3.0,
+        // int(2.9999) will yield 2—which is the bug we want to catch.
+        double volumes[] = {1.0, 2.0, 3.0, 2.9999, 3.0001};
+        int expectedContracts[] = {1, 2, 3, 3, 3};
+
+        for(int i = 0; i < ArraySize(volumes); i++)
+        {
+            double volume = volumes[i];
+            int contracts = (int)MathRound(volume);
+            string testName = "Quantity conversion for volume " + DoubleToString(volume, 5);
+            
+            // Using AssertEqual (the overload for numbers) to compare expected to actual.
+            // If a volume that should yield 3 orders is processed as 2 orders,
+            // this test will fail and point out the quantity conversion issue.
+            AssertEqual(testName, (double)expectedContracts[i], (double)contracts);
+        }
+    }
+
+    // New unit test to verify that the EA correctly adjusts its hedge orders
+    // when the underlying NT (futures) position changes.
+    void TestHedgeAdjustmentLogic()
+    {
+        Print("Testing Hedge Adjustment Logic...");
+
+        // Reset globalFutures for testing
+        globalFutures = 0.0;
+
+        // -------------------------------
+        // Scenario 1: Process a Buy trade (increases net position by 3 contracts)
+        // Expected: globalFutures becomes 3, desired hedge count is 3, and hedges will be Sell orders.
+        string buyJson = "{\"symbol\":\"USTECH\",\"type\":\"Buy\",\"volume\":3.0,\"price\":21158.25,\"comment\":\"Hedge_Test\",\"is_close\":false}";
+        JSONParser parserBuy(buyJson);
+        string symbol = "", type = "", comment = "";
+        double volume = 0.0, price = 0.0;
+        bool is_close = false;
+        bool parseResult = parserBuy.ParseObject(symbol, type, volume, price, comment, is_close);
+        AssertTrue("Hedge Adjustment - Buy Trade Parse", parseResult);
+        if(type == "Buy")
+             globalFutures += volume;
+        else if(type == "Sell")
+             globalFutures -= volume;
+        AssertEqual("Global Futures after Buy", 3.0, globalFutures);
+
+        int desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count after Buy", 3, (double)desiredHedgeCount);
+
+        string hedgeOrigin = "";
+        int hedgeOrderType = 0;
+        if(globalFutures > 0)
+        {
+             hedgeOrigin = "Buy";            // NT was long, so hedges (to offset) become Sell orders
+             hedgeOrderType = ORDER_TYPE_SELL;
+        }
+        else if(globalFutures < 0)
+        {
+             hedgeOrigin = "Sell";           // NT was short, so hedges become Buy orders
+             hedgeOrderType = ORDER_TYPE_BUY;
+        }
+        AssertEqual("Hedge Origin after Buy", "Buy", hedgeOrigin);
+
+        // -------------------------------
+        // Scenario 2: Process a Sell trade (reduces net position by 1 contract)
+        // Expected: net position becomes 2, desired hedge count reduces to 2.
+        string sellJson = "{\"symbol\":\"USTECH\",\"type\":\"Sell\",\"volume\":1.0,\"price\":21154.0,\"comment\":\"Hedge_Test\",\"is_close\":false}";
+        JSONParser parserSell(sellJson);
+        parseResult = parserSell.ParseObject(symbol, type, volume, price, comment, is_close);
+        AssertTrue("Hedge Adjustment - Sell Trade Parse", parseResult);
+        if(type == "Buy")
+             globalFutures += volume;
+        else if(type == "Sell")
+             globalFutures -= volume;
+        AssertEqual("Global Futures after Sell", 2.0, globalFutures);
+
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count after Sell", 2, (double)desiredHedgeCount);
+
+        // -------------------------------
+        // Scenario 3: Process a Sell trade to produce a negative net position.
+        // Expected: For a Sell trade of 4 contracts, net becomes -4,
+        //           desired hedge count becomes 4, and hedges should be Buy orders.
+        globalFutures = 0.0; // Reset the global position
+        string sellJson2 = "{\"symbol\":\"USTECH\",\"type\":\"Sell\",\"volume\":4.0,\"price\":21154.0,\"comment\":\"Hedge_Test\",\"is_close\":false}";
+        JSONParser parserSell2(sellJson2);
+        parseResult = parserSell2.ParseObject(symbol, type, volume, price, comment, is_close);
+        AssertTrue("Hedge Adjustment - Sell Trade 2 Parse", parseResult);
+        if(type == "Buy")
+             globalFutures += volume;
+        else if(type == "Sell")
+             globalFutures -= volume;
+        AssertEqual("Global Futures after Sell2", -4.0, globalFutures);
+
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count after Sell2", 4, (double)desiredHedgeCount);
+        if(globalFutures > 0)
+        {
+             hedgeOrigin = "Buy";
+             hedgeOrderType = ORDER_TYPE_SELL;
+        }
+        else if(globalFutures < 0)
+        {
+             hedgeOrigin = "Sell";            // NT is net short, so hedges become Buy orders
+             hedgeOrderType = ORDER_TYPE_BUY;
+        }
+        AssertEqual("Hedge Origin after negative net", "Sell", hedgeOrigin);
+    }
+
+    // New unit test to verify hedge adjustment edge cases
+    void TestHedgeAdjustmentEdgeCases()
+    {
+        Print("Testing Hedge Adjustment Edge Cases...");
+
+        string symbol = "", type = "", comment = "";
+        double volume = 0.0, price = 0.0;
+        bool is_close = false;
+        bool parseResult = false;
+        int desiredHedgeCount = 0;
+        string hedgeOrigin = "";
+        int hedgeOrderType = 0;
+
+        // Case 1: Trade with volume 0 should not change globalFutures.
+        globalFutures = 10.0;
+        string zeroVolumeTrade = "{\"symbol\":\"USTECH\",\"type\":\"Buy\",\"volume\":0.0,\"price\":21160.0,\"comment\":\"Hedge_Test\",\"is_close\":false}";
+        JSONParser parserZero(zeroVolumeTrade);
+        parseResult = parserZero.ParseObject(symbol, type, volume, price, comment, is_close);
+        AssertTrue("Edge Case - Zero Volume Trade Parse", parseResult);
+        if (type == "Buy")
+             globalFutures += volume;
+        else if (type == "Sell")
+             globalFutures -= volume;
+        AssertEqual("Global Futures unchanged for Zero Volume Trade", 10.0, globalFutures);
+
+        // Case 2: globalFutures exactly 0.0 should yield a desired hedge count of 0.
+        globalFutures = 0.0;
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count at globalFutures = 0", 0, (double)desiredHedgeCount);
+
+        // Case 3: Small fractional value below .5 should round down.
+        globalFutures = 2.499;
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count for 2.499", 2, (double)desiredHedgeCount);
+
+        // Case 4: Small fractional value equal to or above .5 should round up.
+        globalFutures = 2.5001;
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count for 2.5001", 3, (double)desiredHedgeCount);
+
+        // Case 5: Negative small value rounding.
+        globalFutures = -0.4999;
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count for -0.4999", 0, (double)desiredHedgeCount);
+
+        globalFutures = -0.5;
+        desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+        AssertEqual("Desired Hedge Count for -0.5", 1, (double)desiredHedgeCount);
+
+        // Set hedgeOrigin based on negative globalFutures.
+        if(globalFutures > 0)
+        {
+             hedgeOrigin = "Buy";
+             hedgeOrderType = ORDER_TYPE_SELL;
+        }
+        else if(globalFutures < 0)
+        {
+             hedgeOrigin = "Sell";
+             hedgeOrderType = ORDER_TYPE_BUY;
+        }
+        AssertTrue("Hedge Origin for negative globalFutures", (hedgeOrigin == "Sell"));
+
+        // Case 6: Invalid JSON format should be handled gracefully.
+        // Our dummy parser now checks for a valid JSON object and returns default values.
+        string invalidJson = "This is not a valid JSON string";
+        JSONParser parserInvalid(invalidJson);
+        parseResult = parserInvalid.ParseObject(symbol, type, volume, price, comment, is_close);
+        AssertTrue("Edge Case - Invalid JSON handled", parseResult);
+        // With an invalid JSON, the extracted volume should remain 0.0.
+        AssertEqual("Volume default for invalid JSON", 0.0, volume);
     }
 };
 

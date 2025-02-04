@@ -1,55 +1,64 @@
-#property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.35"
+#property version   "1.61"
 #property strict
-#property description "Hedge Receiver EA for NinjaTrader trades"
+#property description "Hedge Receiver EA for Go bridge server"
 
-// Constants
-#define ERR_TRADE_HEDGE_PROHIBITED 4756
+// Error code constant for hedging-related errors
+#define ERR_TRADE_NOT_ALLOWED           4756  // Trading is prohibited
 
-// Input parameters
-input string    BridgeURL = "http://localhost.com:5000";  // Bridge Server URL
-input double    DefaultLot = 0.1;     // Default lot size if not specified
-input int       Slippage  = 200;       // Maximum slippage in points
-input int       PollInterval = 1;     // How often to check for trades (seconds)
-input int       MagicNumber = 12345;  // Magic number for trades
+// Input parameters that can be configured in the EA settings
+input string    BridgeURL = "http://127.0.0.1:5000";  // Bridge Server URL - Connection point to Go bridge
+input double    DefaultLot = 0.1;     // Default lot size if not specified - Base multiplier for trade volumes
+input int       Slippage  = 200;       // Maximum allowed price deviation in points
+input int       PollInterval = 1;     // Frequency of checking for new trades (in seconds)
+input int       MagicNumber = 12345;  // Unique identifier for trades placed by this EA
+input bool      VerboseMode = false;  // Show all polling messages in Experts tab
+input string    CommentPrefix = "NT_Hedge_";  // Prefix for hedge order comments
+
+// Global variable to track the aggregated net futures position from NT trades.
+// A Buy increases the net position; a Sell reduces it.
+double globalFutures = 0.0;
+string lastTradeTime = "";  // Track the last processed trade time
 
 //+------------------------------------------------------------------+
-//| Simple JSON parser class                                          |
+//| Simple JSON parser class for processing bridge messages            |
 //+------------------------------------------------------------------+
 class JSONParser
 {
 private:
-    string json_str;
-    int    pos;
+    string json_str;    // Stores the JSON string to be parsed
+    int    pos;         // Current position in the JSON string during parsing
     
 public:
+    // Constructor initializes parser with JSON string
     JSONParser(string js) { json_str = js; pos = 0; }
     
-    // Skip whitespace
+    // Utility function to skip whitespace characters
     void SkipWhitespace()
     {
         while(pos < StringLen(json_str))
         {
             ushort ch = StringGetCharacter(json_str, pos);
+            // Skip spaces, tabs, newlines, and carriage returns
             if(ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r')
                 break;
             pos++;
         }
     }
     
-    // Parse a string value
+    // Parse a JSON string value enclosed in quotes
     bool ParseString(string &value)
     {
         if(pos >= StringLen(json_str)) return false;
         
         SkipWhitespace();
         
-        // Must start with quote
+        // Verify string starts with quote
         if(StringGetCharacter(json_str, pos) != '"')
             return false;
         pos++;
         
+        // Build string until closing quote
         value = "";
         while(pos < StringLen(json_str))
         {
@@ -59,13 +68,13 @@ public:
                 pos++;
                 return true;
             }
-            value += ShortToString(ch);
+            value += CharToString((uchar)ch);
             pos++;
         }
         return false;
     }
     
-    // Parse a number value
+    // Parse a numeric value (integer or decimal)
     bool ParseNumber(double &value)
     {
         if(pos >= StringLen(json_str)) return false;
@@ -75,19 +84,20 @@ public:
         string num = "";
         bool hasDecimal = false;
         
-        // Optional minus sign
+        // Handle negative numbers
         if(StringGetCharacter(json_str, pos) == '-')
         {
             num += "-";
             pos++;
         }
         
+        // Build number string including decimal point if present
         while(pos < StringLen(json_str))
         {
             ushort ch = StringGetCharacter(json_str, pos);
             if(ch >= '0' && ch <= '9')
             {
-                num += ShortToString(ch);
+                num += CharToString((uchar)ch);
             }
             else if(ch == '.' && !hasDecimal)
             {
@@ -99,17 +109,19 @@ public:
             pos++;
         }
         
+        // Convert string to double
         value = StringToDouble(num);
         return true;
     }
     
-    // Parse a boolean value
+    // Parse boolean true/false values
     bool ParseBool(bool &value)
     {
         if(pos >= StringLen(json_str)) return false;
         
         SkipWhitespace();
         
+        // Check for "true" literal
         if(pos + 4 <= StringLen(json_str) && StringSubstr(json_str, pos, 4) == "true")
         {
             value = true;
@@ -117,6 +129,7 @@ public:
             return true;
         }
         
+        // Check for "false" literal
         if(pos + 5 <= StringLen(json_str) && StringSubstr(json_str, pos, 5) == "false")
         {
             value = false;
@@ -127,7 +140,7 @@ public:
         return false;
     }
     
-    // Skip a value (string, number, boolean, null, object, or array)
+    // Skip over any JSON value without parsing it
     void SkipValue()
     {
         SkipWhitespace();
@@ -136,7 +149,8 @@ public:
         
         ushort ch = StringGetCharacter(json_str, pos);
         
-        if(ch == '"')  // String
+        // Handle different value types
+        if(ch == '"')  // Skip string
         {
             pos++;
             while(pos < StringLen(json_str))
@@ -149,7 +163,7 @@ public:
                 pos++;
             }
         }
-        else if(ch == '{')  // Object
+        else if(ch == '{')  // Skip object
         {
             int depth = 1;
             pos++;
@@ -161,7 +175,7 @@ public:
                 pos++;
             }
         }
-        else if(ch == '[')  // Array
+        else if(ch == '[')  // Skip array
         {
             int depth = 1;
             pos++;
@@ -173,7 +187,7 @@ public:
                 pos++;
             }
         }
-        else if(ch == 't' || ch == 'f')  // true or false
+        else if(ch == 't' || ch == 'f')  // Skip boolean
         {
             while(pos < StringLen(json_str))
             {
@@ -182,11 +196,11 @@ public:
                 pos++;
             }
         }
-        else if(ch == 'n')  // null
+        else if(ch == 'n')  // Skip null
         {
-            pos += 4;  // Skip "null"
+            pos += 4;
         }
-        else  // Number
+        else  // Skip number
         {
             while(pos < StringLen(json_str))
             {
@@ -197,104 +211,104 @@ public:
         }
     }
     
-    // Parse the entire trade object
-    bool ParseObject(string &symbol, string &type, double &volume, double &price, string &comment, bool &is_close)
+    // Parse a complete trade object from JSON
+    bool ParseObject(string &type, double &volume, double &price, string &executionId, bool &isExit)
     {
-        if(pos >= StringLen(json_str)) return false;
-        
+        // Skip any leading whitespace and ensure object starts with '{'
         SkipWhitespace();
-        
-        // Must start with {
         if(StringGetCharacter(json_str, pos) != '{')
             return false;
-        pos++;
-        
-        // Initialize required field flags
-        bool has_symbol = false;
-        bool has_type = false;
-        bool has_volume = false;
-        bool has_price = false;
-        bool has_comment = false;
-        bool has_is_close = false;
-        
-        while(pos < StringLen(json_str))
+        pos++; // skip '{'
+
+        // Initialize defaults
+        type = "";
+        volume = 0.0;
+        price = 0.0;
+        executionId = "";
+        isExit = false;
+
+        // Loop through key/value pairs
+        while(true)
         {
             SkipWhitespace();
-            
-            // Check for end of object
-            if(StringGetCharacter(json_str, pos) == '}')
+            if(pos >= StringLen(json_str))
+                return false;
+
+            ushort ch = StringGetCharacter(json_str, pos);
+            // End of object
+            if(ch == '}')
             {
-                pos++;
-                // Verify all required fields were found
-                return has_symbol && has_type && has_volume && has_price && has_comment && has_is_close;
+                pos++; // skip '}'
+                break;
             }
             
             // Parse the key
-            string key;
+            string key = "";
             if(!ParseString(key))
                 return false;
-                
-            SkipWhitespace();
             
-            // Must have a colon
+            SkipWhitespace();
             if(StringGetCharacter(json_str, pos) != ':')
                 return false;
-            pos++;
+            pos++; // skip ':'
+            SkipWhitespace();
             
-            // Parse the value based on the key
-            if(key == "symbol")
+            // Parse the value based on the key. Note the new checks.
+            if(key=="action" || key=="type")
             {
-                if(!ParseString(symbol)) return false;
-                has_symbol = true;
+                if(!ParseString(type))
+                    return false;
             }
-            else if(key == "type")
+            else if(key=="quantity" || key=="volume")
             {
-                if(!ParseString(type)) return false;
-                has_type = true;
+                if(!ParseNumber(volume))
+                    return false;
             }
-            else if(key == "volume")
+            else if(key=="price")
             {
-                if(!ParseNumber(volume)) return false;
-                has_volume = true;
+                if(!ParseNumber(price))
+                    return false;
             }
-            else if(key == "price")
+            else if(key=="executionId")
             {
-                if(!ParseNumber(price)) return false;
-                has_price = true;
+                if(!ParseString(executionId))
+                    return false;
             }
-            else if(key == "comment")
+            else if(key=="isExit" || key=="is_close")
             {
-                if(!ParseString(comment)) return false;
-                has_comment = true;
-            }
-            else if(key == "is_close")
-            {
-                if(!ParseBool(is_close)) return false;
-                has_is_close = true;
+                if(!ParseBool(isExit))
+                    return false;
             }
             else
             {
-                // Skip unknown field value
+                // For any unknown key, just skip its value
                 SkipValue();
             }
             
             SkipWhitespace();
-            
-            // Skip comma if present
-            if(StringGetCharacter(json_str, pos) == ',')
-                pos++;
+            // If there's a comma, continue parsing the next pair.
+            if(pos < StringLen(json_str) && StringGetCharacter(json_str, pos)==',')
+            {
+                pos++; // skip comma
+                continue;
+            }
+            // End of the object
+            if(pos < StringLen(json_str) && StringGetCharacter(json_str, pos)=='}')
+            {
+                pos++; // skip closing brace
+                break;
+            }
         }
-        
-        return false;  // Reached end of input without finding closing }
+        return true;
     }
 };
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                     |
+//| Expert initialization function - Called when EA is first loaded    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Check if automated trading is allowed
+   // Verify automated trading is enabled in MT5
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
    {
       MessageBox("Please enable automated trading in MT5 settings!", "Error", MB_OK|MB_ICONERROR);
@@ -309,239 +323,424 @@ int OnInit()
       Print("Current margin mode: ", margin_mode);
    }
    
-   // Add URL to allowed list
-   string url = BridgeURL + "/mt5/get_trade";
+   Print("Testing connection to bridge server...");
+   
+   // Test bridge connection with health check
    char tmp[];
    string headers = "";
-   if(!WebRequest("GET", url, headers, 0, tmp, tmp, headers))
+   string response_headers;
+   
+   if(!WebRequest("GET", BridgeURL + "/health", headers, 0, tmp, tmp, response_headers))
    {
       int error = GetLastError();
       if(error == ERR_FUNCTION_NOT_ALLOWED)
       {
-         MessageBox("Please allow WebRequest for " + url, "Error", MB_OK|MB_ICONERROR);
+         MessageBox("Please allow WebRequest for " + BridgeURL, "Error", MB_OK|MB_ICONERROR);
          string terminal_data_path = TerminalInfoString(TERMINAL_DATA_PATH);
          string filename = terminal_data_path + "\\MQL5\\config\\terminal.ini";
-         Print("Add the following URL to " + filename + " in [WebRequest] section:");
-         Print(url);
+         Print("Add the following URLs to " + filename + " in [WebRequest] section:");
+         Print(BridgeURL + "/mt5/get_trade");
+         Print(BridgeURL + "/mt5/trade_result");
+         Print(BridgeURL + "/health");
          return INIT_FAILED;
       }
+      Print("ERROR: Could not connect to bridge server!");
+      Print("Make sure the bridge server is running and accessible at: ", BridgeURL);
+      return INIT_FAILED;
    }
    
-   Print("HedgeReceiver EA initialized successfully");
-   EventSetMillisecondTimer(PollInterval * 1000);
+   Print("=================================");
+   Print("✓ Bridge server connection test passed");
+   Print("✓ HedgeReceiver EA initialized successfully");
+   Print("✓ Connected to bridge server at: ", BridgeURL);
+   Print("✓ Monitoring for trades...");
+   Print("=================================");
+   
+   // Set up timer for periodic trade checks
+   EventSetMillisecondTimer(PollInterval * 100);
    
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                   |
+//| Expert deinitialization function - Cleanup when EA is removed      |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // Stop the timer to prevent further trade checks
    EventKillTimer();
 }
 
 //+------------------------------------------------------------------+
-//| Timer function                                                     |
+//| Helper function to extract a double value from a JSON string for |
+//| a given key                                                      |
+//+------------------------------------------------------------------+
+double GetJSONDouble(string json, string key)
+{
+   string searchKey = "\"" + key + "\"";
+   int keyPos = StringFind(json, searchKey);
+   if(keyPos == -1)
+      return 0.0;
+      
+   int colonPos = StringFind(json, ":", keyPos);
+   if(colonPos == -1)
+      return 0.0;
+      
+   int start = colonPos + 1;
+   // Skip whitespace characters
+   while(start < StringLen(json))
+   {
+      ushort ch = StringGetCharacter(json, start);
+      if(ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r')
+         break;
+      start++;
+   }
+   
+   // Build the numeric string
+   string numStr = "";
+   while(start < StringLen(json))
+   {
+      ushort ch = StringGetCharacter(json, start);
+      if((ch >= '0' && ch <= '9') || ch == '.' || ch == '-')
+      {
+         numStr += CharToString((uchar)ch);
+         start++;
+      }
+      else
+         break;
+   }
+   
+   return StringToDouble(numStr);
+}
+
+//+------------------------------------------------------------------+
+//| Helper function to count open hedge positions with a given hedge origin.
+//| The hedge origin is stored in the order comment as "NT_Hedge_" + origin.
+//+------------------------------------------------------------------+
+int CountHedgePositions(string hedgeOrigin)
+{
+   int count = 0;
+   
+   // First get total number of positions
+   int total = PositionsTotal();
+   
+   // Loop through all positions
+   for(int i = 0; i < total; i++)
+   {
+       // Get position ticket
+       ulong ticket = PositionGetTicket(i);
+       if(ticket <= 0) continue;
+       
+       // Select the position
+       if(!PositionSelectByTicket(ticket)) continue;
+       
+       // Check if it's for our symbol
+       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+       
+       // Check if it's our EA's position by magic number
+       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+       
+       // Get and check the comment
+       string comment = PositionGetString(POSITION_COMMENT);
+       string searchStr = "NT_Hedge_" + hedgeOrigin;
+       if(StringFind(comment, searchStr) != -1)
+       {
+           // Count each 0.02 lot as 1 position
+           double posVolume = PositionGetDouble(POSITION_VOLUME);
+           count += (int)MathRound(posVolume / DefaultLot);
+       }
+   }
+   
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Helper function to close one hedge position matching the provided hedge origin.
+//| Returns true if a hedge position is closed successfully.
+//+------------------------------------------------------------------+
+bool CloseOneHedgePosition(string hedgeOrigin, string specificTradeId="")
+{
+   // First get total number of positions
+   int total = PositionsTotal();
+   
+   // Loop through all positions
+   for(int i = 0; i < total; i++)
+   {
+       // Get position ticket
+       ulong ticket = PositionGetTicket(i);
+       if(ticket <= 0) continue;
+       
+       // Select the position
+       if(!PositionSelectByTicket(ticket)) continue;
+       
+       // Check if it's for our symbol
+       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+       
+       // Check if it's our EA's position by magic number
+       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+       
+       // Get and check the comment
+       string comment = PositionGetString(POSITION_COMMENT);
+       string searchStr = CommentPrefix + hedgeOrigin;
+       
+       // If we're looking for a specific trade ID, make sure it matches
+       if(specificTradeId != "" && StringFind(comment, specificTradeId) == -1)
+           continue;
+       
+       if(StringFind(comment, searchStr) != -1)
+       {
+           double posVolume = PositionGetDouble(POSITION_VOLUME);
+           ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+           
+           MqlTradeRequest closeRequest = {};
+           MqlTradeResult closeResult = {};
+           
+           closeRequest.action = TRADE_ACTION_DEAL;
+           closeRequest.position = ticket;
+           closeRequest.symbol = _Symbol;
+           closeRequest.volume = DefaultLot; // Close only one contract worth
+           closeRequest.magic = MagicNumber;
+           closeRequest.deviation = Slippage;
+           closeRequest.type = posType == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+           closeRequest.price = SymbolInfoDouble(_Symbol, closeRequest.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
+           
+           Print(StringFormat("DEBUG: Closing hedge position - Ticket: %d, Volume: %.2f, Type: %s, Comment: %s", 
+                 ticket, closeRequest.volume, posType == POSITION_TYPE_BUY ? "Buy" : "Sell", comment));
+           
+           if(OrderSend(closeRequest, closeResult))
+           {
+               Print("DEBUG: Hedge position closed successfully. Ticket: ", closeResult.order);
+               // Extract trade ID from comment if it exists
+               string closedTradeId = "";
+               int idStart = StringFind(comment, "_", StringFind(comment, hedgeOrigin)) + 1;
+               if(idStart > 0)
+               {
+                   closedTradeId = StringSubstr(comment, idStart);
+                   Print("DEBUG: Extracted trade ID from closing position: ", closedTradeId);
+               }
+               SendTradeResult(closeRequest.volume, closeResult.order, true, closedTradeId);
+               return true;
+           }
+           else
+           {
+               Print("DEBUG: Failed to close hedge position. Error: ", GetLastError());
+               return false;
+           }
+       }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - Called periodically to check for new trades     |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+   // Get any pending trades from the bridge.
    string response = GetTradeFromBridge();
    if(response == "") return;
    
-   Print("Response: ", response);
-   Print("");
+   Print("DEBUG: Received trade response: ", response);
+   
+   // Check for duplicate trade based on timestamp
+   string tradeTime = "";
+   int timePos = StringFind(response, "\"time\":\"");
+   if(timePos >= 0)
+   {
+       timePos += 8;  // Length of "\"time\":\""
+       int timeEndPos = StringFind(response, "\"", timePos);
+       if(timeEndPos > timePos)
+       {
+           tradeTime = StringSubstr(response, timePos, timeEndPos - timePos);
+           if(tradeTime == lastTradeTime)
+           {
+               Print("DEBUG: Ignoring duplicate trade with time: ", tradeTime);
+               return;
+           }
+           lastTradeTime = tradeTime;
+       }
+   }
    
    Print("Processing trade response...");
    
-   // Parse the JSON response
+   // Parse trade information from the JSON response.
    JSONParser parser(response);
-   string symbol = "", type = "", comment = "";
+   string type = "";
    double volume = 0.0, price = 0.0;
-   bool is_close = false;
+   string executionId = "";
+   bool isExit = false;
    
-   if(!parser.ParseObject(symbol, type, volume, price, comment, is_close))
+   if(!parser.ParseObject(type, volume, price, executionId, isExit))
    {
-      Print("Failed to parse JSON response");
+      Print("DEBUG: Failed to parse JSON response: ", response);
       return;
    }
    
-   // Scale volume to match DefaultLot setting
-   volume = volume * DefaultLot;
-   
-   Print("Trade data parsed successfully:");
-   Print("- Symbol: ", symbol);
-   Print("- Type: ", type);
-   Print("- Volume: ", volume);
-   Print("- Price: ", price);
-   Print("- Is Close: ", is_close);
-   Print("- Comment: ", comment);
-   
-   // Check if symbol exists in Market Watch
-   Print("Checking symbol: ", symbol);
-   if(!SymbolSelect(symbol, true))
+   // Extract trade ID from response if it exists
+   string tradeId = "";
+   int idPos = StringFind(response, "\"id\":\"");
+   if(idPos >= 0)
    {
-      Print("Symbol not found in Market Watch: ", symbol);
-      return;
+       idPos += 6;  // Length of "\"id\":\""
+       int idEndPos = StringFind(response, "\"", idPos);
+       if(idEndPos > idPos)
+       {
+           tradeId = StringSubstr(response, idPos, idEndPos - idPos);
+           Print("DEBUG: Found trade ID: ", tradeId);
+       }
    }
-   Print("Symbol found in Market Watch: ", symbol);
    
-   // Process the trade
-   MqlTradeRequest request = {};
-   MqlTradeResult result = {};
-   
-   // Set up the trade request
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = symbol;
-   request.volume = volume;
-   request.magic = MagicNumber;
-   request.comment = comment;
-   request.type_filling = ORDER_FILLING_FOK;
-   request.deviation = Slippage;
-   
-   // If this is a close request, first close any existing positions
-   if(is_close)
+   // If the response contains a "quantity" field, override the parsed volume.
+   if(StringFind(response, "\"quantity\"") != -1)
    {
-      Print("Total positions: ", PositionsTotal());
-      bool found_position = false;
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
+       double qty = GetJSONDouble(response, "quantity");
+       Print("DEBUG: Found 'quantity' field in JSON, overriding parsed volume with value: ", qty);
+       volume = qty;
+   }
+   
+   // Calculate lot size based on quantity
+   double lotSize = DefaultLot;  // Use fixed lot size for each hedge order
+   Print("DEBUG: Using lot size for hedge orders: ", lotSize);
+
+   // Update the global futures position based on trade type
+   double prevFutures = globalFutures;
+   if(type == "Buy" || type == "BuyToCover")
+      globalFutures += volume;
+   else if(type == "Sell" || type == "SellShort")
+      globalFutures -= volume;
+
+   Print("DEBUG: Updated global futures position: ", globalFutures);
+   
+   // Compute the desired hedge count from the absolute net futures.
+   int desiredHedgeCount = (int)MathRound(MathAbs(globalFutures));
+   Print("DEBUG: Desired hedge count: ", desiredHedgeCount);
+   
+   if(MathAbs(globalFutures) < 0.000001)
+   {
+      Print("DEBUG: Net futures position is zero. Initiating closure of all hedge orders.");
+      
+      int hedgeCountBuy = CountHedgePositions("Buy");
+      int hedgeCountSell = CountHedgePositions("Sell");
+      Print("DEBUG: Current hedge orders - Buy: ", hedgeCountBuy, ", Sell: ", hedgeCountSell);
+      
+      // Close all Buy hedge orders.
+      while(hedgeCountBuy > 0)
       {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket <= 0) continue;
-         
-         if(!PositionSelectByTicket(ticket)) continue;
-         
-         string pos_symbol = PositionGetString(POSITION_SYMBOL);
-         if(pos_symbol != symbol) continue;
-         
-         double pos_volume = PositionGetDouble(POSITION_VOLUME);
-         ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         
-         Print("Found position - Type: ", pos_type == POSITION_TYPE_BUY ? "Buy" : "Sell", ", Volume: ", pos_volume);
-         
-         request.action = TRADE_ACTION_DEAL;
-         request.position = ticket;
-         request.volume = pos_volume;
-         request.type = pos_type == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         request.price = SymbolInfoDouble(symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
-         
-         Print("Closing position - Type: ", request.type == ORDER_TYPE_BUY ? "Buy" : "Sell", ", Volume: ", request.volume, ", Price: ", request.price);
-         
-         if(!OrderSend(request, result))
+         if(!CloseOneHedgePosition("Buy"))
          {
-            Print("Failed to close position. Error: ", GetLastError());
-            continue;
+            Print("ERROR: Failed to close a Buy hedge order.");
+            break;
          }
-         
-         Print("Position closed successfully");
-         found_position = true;
+         Sleep(500);
+         hedgeCountBuy = CountHedgePositions("Buy");
+         Print("DEBUG: Updated Buy hedge order count: ", hedgeCountBuy);
       }
       
-      if(found_position)
+      // Close all Sell hedge orders.
+      while(hedgeCountSell > 0)
       {
-         SendTradeResult(symbol, volume, result.order, true);
-         return;
-      }
-      else
-      {
-         Print("No positions found to close, proceeding to open new position");
-         // Continue to open new position since there was nothing to close
-         is_close = false;  // Reset is_close flag since we're opening a new position
+         if(!CloseOneHedgePosition("Sell"))
+         {
+            Print("ERROR: Failed to close a Sell hedge order.");
+            break;
+         }
+         Sleep(500);
+         hedgeCountSell = CountHedgePositions("Sell");
+         Print("DEBUG: Updated Sell hedge order count: ", hedgeCountSell);
       }
    }
    else
    {
-      // For new trades, first close any opposite positions
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      string hedgeOrigin = "";
+      int hedgeOrderType = 0;
+      if(globalFutures > 0)
       {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket <= 0) continue;
-         
-         if(!PositionSelectByTicket(ticket)) continue;
-         
-         string pos_symbol = PositionGetString(POSITION_SYMBOL);
-         if(pos_symbol != symbol) continue;
-         
-         ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         bool is_opposite = (type == "Buy" && pos_type == POSITION_TYPE_SELL) || 
-                          (type == "Sell" && pos_type == POSITION_TYPE_BUY);
-         
-         Print("Checking position - Type: ", pos_type == POSITION_TYPE_BUY ? "Buy" : "Sell", 
-               ", Incoming type: ", type, 
-               ", Is opposite: ", is_opposite ? "true" : "false");
-         
-         if(is_opposite)
-         {
-            request.action = TRADE_ACTION_DEAL;
-            request.position = ticket;
-            request.volume = PositionGetDouble(POSITION_VOLUME);
-            request.type = pos_type == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-            request.price = SymbolInfoDouble(symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
-            
-            Print("Closing opposite position before new trade");
-            
-            if(!OrderSend(request, result))
+            hedgeOrigin = "Buy";
+            hedgeOrderType = ORDER_TYPE_SELL;
+      }
+      else if(globalFutures < 0)
+      {
+            hedgeOrigin = "Sell";
+            hedgeOrderType = ORDER_TYPE_BUY;
+      }
+      Print("DEBUG: Hedge Origin: ", hedgeOrigin);
+      
+      // Get the current number of open hedge orders for this side.
+      int currentHedgeCount = CountHedgePositions(hedgeOrigin);
+      Print("DEBUG: Current hedge count (", hedgeOrigin, "): ", currentHedgeCount);
+      
+      // If we have too many hedge orders, close them one at a time
+      while(currentHedgeCount > desiredHedgeCount)
+      {
+            Print("DEBUG: Closing excess hedge position. Current: ", currentHedgeCount, ", Desired: ", desiredHedgeCount);
+            if(!CloseOneHedgePosition(hedgeOrigin))
             {
-               Print("Failed to close opposite position. Error: ", GetLastError());
-               return;
+                Print("ERROR: Failed to close an excess hedge order.");
+                break;
             }
+            Sleep(500);
+            currentHedgeCount = CountHedgePositions(hedgeOrigin);
+            Print("DEBUG: Updated hedge count after closing: ", currentHedgeCount);
+      }
+      
+      // If we need more hedge orders, place them one at a time
+      while(currentHedgeCount < desiredHedgeCount)
+      {
+            Print("DEBUG: Adding new hedge position. Current: ", currentHedgeCount, ", Desired: ", desiredHedgeCount);
+            MqlTradeRequest request = {};
+            MqlTradeResult result = {};
+            request.action    = TRADE_ACTION_DEAL;
+            request.symbol    = _Symbol;
+            request.volume    = lotSize;
+            request.magic     = MagicNumber;
+            request.deviation = Slippage;
             
-            Print("Opposite position closed successfully");
-            Sleep(100); // Add a small delay to allow MT5 to process the position closure
-         }
+            // Use the trade ID directly from NinjaTrader
+            request.comment   = tradeId != "" ? StringFormat("%s%s_%s", CommentPrefix, hedgeOrigin, tradeId) 
+                                           : StringFormat("%s%s", CommentPrefix, hedgeOrigin);
+            request.type      = (ENUM_ORDER_TYPE)hedgeOrderType;
+            request.price     = SymbolInfoDouble(_Symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
+            
+            if(OrderSend(request, result))
+            {
+                  Print("DEBUG: New hedge order placed successfully. Ticket: ", result.order);
+                  SendTradeResult(request.volume, result.order, false, tradeId);
+            }
+            else
+            {
+                  Print("ERROR: Failed to place new hedge order. Error: ", GetLastError());
+                  break;
+            }
+            Sleep(500);
+            currentHedgeCount = CountHedgePositions(hedgeOrigin);
+            Print("DEBUG: Updated hedge count after placement: ", currentHedgeCount);
       }
    }
-   
-   // If this was just a close request and we didn't find a position to close, we're done
-   if(is_close) return;
-   
-   // Place the market order - use same direction as NinjaTrader since we're hedging
-   request.type = type == "Buy" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   request.price = SymbolInfoDouble(symbol, request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
-   request.volume = volume;
-   
-   Print("Placing market order: ", request.type == ORDER_TYPE_BUY ? "Buy" : "Sell", " ", request.volume, " lots at ", request.price);
-   
-   // Try up to 3 times with increasing delays if we get ERR_TRADE_HEDGE_PROHIBITED
-   for(int attempt = 1; attempt <= 3; attempt++)
-   {
-      if(OrderSend(request, result))
-      {
-         Print("Order placed successfully. Ticket: ", result.order);
-         SendTradeResult(symbol, volume, result.order, false);
-         return;
-      }
-      
-      int error = GetLastError();
-      if(error == ERR_TRADE_HEDGE_PROHIBITED)
-      {
-         Print("Attempt ", attempt, " failed with ERR_TRADE_HEDGE_PROHIBITED. Waiting before retry...");
-         Sleep(100 * attempt); // Increase delay with each attempt
-         continue;
-      }
-      
-      Print("Order failed. Error: ", error);
-      return;
-   }
-   
-   Print("Failed to place order after 3 attempts");
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                              |
+//| Expert tick function - Not used in this EA                       |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Main trading logic is handled in OnTimer
+   // Trading logic is handled in OnTimer instead
 }
 
-bool SendTradeResult(string symbol, double volume, ulong ticket, bool is_close)
+// Send trade execution result back to bridge
+bool SendTradeResult(double volume, ulong ticket, bool is_close, string tradeId="")
 {
-   string result = StringFormat("{\"status\":\"success\",\"ticket\":%I64u,\"symbol\":\"%s\",\"volume\":%.2f,\"is_close\":%s}",
-                               ticket, symbol, volume, is_close ? "true" : "false");
+   // Format result as JSON
+   string result;
+   if(tradeId != "")
+      result = StringFormat("{\"status\":\"success\",\"ticket\":%I64u,\"volume\":%.2f,\"is_close\":%s,\"id\":\"%s\"}",
+                           ticket, volume, is_close ? "true" : "false", tradeId);
+   else
+      result = StringFormat("{\"status\":\"success\",\"ticket\":%I64u,\"volume\":%.2f,\"is_close\":%s}",
+                           ticket, volume, is_close ? "true" : "false");
    
    Print("Preparing to send result: ", result);
    
+   // Prepare data for web request
    char result_data[];
    StringToCharArray(result, result_data);
    
@@ -549,6 +748,7 @@ bool SendTradeResult(string symbol, double volume, ulong ticket, bool is_close)
    char response_data[];
    string response_headers;
    
+   // Send result to bridge
    int res = WebRequest("POST", BridgeURL + "/mt5/trade_result", headers, 0, result_data, response_data, response_headers);
    
    if(res == -1)
@@ -561,62 +761,15 @@ bool SendTradeResult(string symbol, double volume, ulong ticket, bool is_close)
    return true;
 }
 
-bool ClosePosition(string symbol, double volume, ENUM_POSITION_TYPE type)
-{
-   Print("Looking for position to close - Symbol: ", symbol, ", Volume: ", volume, ", Type: ", type);
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket <= 0) continue;
-      
-      if(!PositionSelectByTicket(ticket)) continue;
-      
-      string pos_symbol = PositionGetString(POSITION_SYMBOL);
-      double pos_volume = PositionGetDouble(POSITION_VOLUME);
-      ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      
-      Print("Checking position - Ticket: ", ticket, ", Symbol: ", pos_symbol, ", Volume: ", pos_volume, ", Type: ", pos_type);
-      
-      if(pos_symbol == symbol && pos_type == type)
-      {
-         Print("Found matching position to close");
-         
-         MqlTradeRequest request = {};
-         MqlTradeResult result = {};
-         
-         request.action = TRADE_ACTION_DEAL;
-         request.position = ticket;
-         request.symbol = symbol;
-         request.volume = volume;
-         request.deviation = Slippage;
-         request.magic = MagicNumber;
-         request.type = type == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         request.price = SymbolInfoDouble(symbol, type == POSITION_TYPE_BUY ? SYMBOL_BID : SYMBOL_ASK);
-         request.comment = "Close hedge position";
-         
-         Print("Sending close request - Type: ", request.type, ", Price: ", request.price);
-         
-         if(!OrderSend(request, result))
-         {
-            Print("OrderSend error: ", GetLastError());
-            return false;
-         }
-         
-         Print("Position closed successfully");
-         return true;
-      }
-   }
-   
-   Print("No matching position found to close");
-   return false;
-}
-
+// Get pending trades from bridge server
 string GetTradeFromBridge()
 {
+   // Initialize request variables
    char response_data[];
    string headers = "";
    string response_headers;
+   
+   // Send request to bridge
    int web_result = WebRequest("GET", BridgeURL + "/mt5/get_trade", headers, 0, response_data, response_data, response_headers);
    
    if(web_result == -1)
@@ -628,8 +781,14 @@ string GetTradeFromBridge()
       return "";
    }
    
+   // Convert response to string
    string response_str = CharArrayToString(response_data);
-   Print("Response: ", response_str);
+   
+   // Only print response if it's not "no_trade" or if verbose mode is on
+   if(VerboseMode || StringFind(response_str, "no_trade") < 0)
+   {
+      Print("Response: ", response_str);
+   }
    
    // Check if response is HTML (indicates error page)
    if(StringFind(response_str, "<!doctype html>") >= 0 || StringFind(response_str, "<html") >= 0)
@@ -652,4 +811,51 @@ string GetTradeFromBridge()
    }
    
    return response_str;
-} 
+}
+
+// Helper function to close a hedge position matching the provided hedge origin.
+// Returns true if a hedge position is closed successfully.
+bool CloseHedgePosition(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket))
+   {
+      Print("ERROR: Hedge position not found for ticket ", ticket);
+      return false;
+   }
+   string sym = PositionGetString(POSITION_SYMBOL);
+   double volume = PositionGetDouble(POSITION_VOLUME);
+   long pos_type = PositionGetInteger(POSITION_TYPE); // POSITION_TYPE_BUY or POSITION_TYPE_SELL
+   ENUM_ORDER_TYPE closing_order_type;
+   if(pos_type == POSITION_TYPE_BUY)
+       closing_order_type = ORDER_TYPE_SELL;
+   else if(pos_type == POSITION_TYPE_SELL)
+       closing_order_type = ORDER_TYPE_BUY;
+   else
+   {
+      Print("ERROR: Unknown position type for hedge ticket ", ticket);
+      return false;
+   }
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   request.action    = TRADE_ACTION_DEAL;
+   request.symbol    = sym;
+   request.volume    = volume;
+   request.magic     = MagicNumber;
+   request.deviation = Slippage;
+   request.comment   = "NT_Hedge_Close";
+   request.type      = closing_order_type;
+   request.price     = SymbolInfoDouble(sym, (request.type == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID));
+   
+   Print(StringFormat("DEBUG: Closing hedge position - Ticket: %I64u, Volume: %.2f", ticket, volume));
+   if(OrderSend(request, result))
+   {
+      Print("DEBUG: Hedge position closed successfully. Ticket: ", result.order);
+      SendTradeResult(volume, result.order, true);
+      return true;
+   }
+   else
+   {
+      Print("ERROR: Failed to close hedge position. Error: ", GetLastError());
+      return false;
+   }
+}
